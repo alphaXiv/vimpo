@@ -1,5 +1,8 @@
 # VIMPO: Value-Implicit Policy Optimization
 
+[![arXiv](https://img.shields.io/badge/arXiv-2606.20008-B31B1B?style=for-the-badge&logo=arxiv&logoColor=white)](https://arxiv.org/abs/2606.20008)
+[![Post](https://img.shields.io/badge/Post-000000?style=for-the-badge&logo=x&logoColor=white)](https://x.com/xuandongzhao/status/2068217433001959894)
+
 This repository contains the VIMPO implementation used for the paper **"VIMPO: Value-Implicit Policy Optimization for LLMs."** It is a focused fork of `verl` for mathematical RLVR experiments. The repo keeps the core distributed `verl` trainer stack, the DAPO reward-manager baseline, and a `recipe/vimpo` entry point implementing the VIMPO terminal value objective with the PPO actor branch described in the paper.
 
 ## Research Direction
