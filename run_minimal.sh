@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# Minimal end-to-end VIMPO reproduction (arXiv 2606.20008).
+# Scaled VIMPO-vs-GRPO comparison for arXiv 2606.20008.
 #
-# Goal: demonstrate the paper's core mechanism — the Value-Implicit Policy
-# Optimization objective (policy-implied value loss + PPO actor branch driven by
-# the log-ratio TD advantage) — running end to end on a single GPU, on a small
-# model and a small slice of the paper's actual math RLVR data.
-#
-# This is intentionally a smoke-scale config, not the full Qwen3-4B / 54.4k run.
+# This branch runs a single objective (RUN_MODE below is hardcoded per branch).
+# The VIMPO and GRPO branches share an IDENTICAL config except for RUN_MODE,
+# isolating the paper's claim: the VIMPO objective (policy-implied value loss +
+# PPO actor branch on the log-ratio TD advantage) vs the GRPO baseline.
 set -uo pipefail
+
+# ===== the only thing that differs between the two comparison branches =====
+RUN_MODE="grpo"   # "vimpo" or "grpo"
+# ===========================================================================
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${REPO_ROOT}"
@@ -16,48 +18,40 @@ ART_DIR="${REPO_ROOT}/.openresearch/artifacts"
 mkdir -p "${ART_DIR}"
 EVAL_MD="${ART_DIR}/EVAL.md"
 RUN_LOG="${ART_DIR}/run.log"
-
-# Mirror everything to a persisted artifact log too.
 exec > >(tee -a "${RUN_LOG}") 2>&1
 
 fail() {
-    echo "[run_minimal] FAILED: $*"
+    echo "[run] FAILED: $*"
     {
-        echo "# VIMPO minimal reproduction — FAILED"
+        echo "# VIMPO comparison (${RUN_MODE}) — FAILED"
         echo
         echo "Stage: $*"
-        echo
-        echo "See run.log artifact for details."
     } > "${EVAL_MD}"
     exit 1
 }
 
 echo "=============================================="
-echo "VIMPO minimal reproduction"
-echo "repo root: ${REPO_ROOT}"
+echo "VIMPO vs GRPO comparison — arm: ${RUN_MODE}"
 echo "start: $(date -u)"
 echo "=============================================="
 nvidia-smi || true
 
 ############################################
-# 1. System + python deps
+# 1. Deps (same stack proven by the smoke run)
 ############################################
-echo "[run_minimal] installing system packages"
 apt-get update -y >/dev/null 2>&1 || true
 apt-get install -y git wget build-essential libnuma-dev numactl >/dev/null 2>&1 || true
 
 export HF_HUB_ENABLE_HF_TRANSFER=1
 export PIP_ROOT_USER_ACTION=ignore
 export TOKENIZERS_PARALLELISM=false
-
 PY=python3
-echo "[run_minimal] python: $(${PY} --version 2>&1)"
 
-echo "[run_minimal] installing vllm (pulls a compatible torch) — this is the long step"
+echo "[run] installing vllm (long step)"
 ${PY} -m pip install --upgrade pip >/dev/null 2>&1 || true
 ${PY} -m pip install "vllm==0.17.0" || fail "pip install vllm"
 
-echo "[run_minimal] installing verl runtime deps"
+echo "[run] installing verl runtime deps"
 ${PY} -m pip install \
     "accelerate" "codetiming" "datasets" "dill" "hydra-core" \
     "numpy<2.0.0" "pandas" "peft" "pyarrow>=19.0.0" "pybind11" "pylatexenc" \
@@ -66,66 +60,55 @@ ${PY} -m pip install \
     "math-verify" "latex2sympy2_extended" "liger-kernel" "hf_transfer" \
     || fail "pip install verl deps"
 
-echo "[run_minimal] installing flash-attn (prebuilt wheel preferred)"
+echo "[run] installing flash-attn (prebuilt preferred, else source build)"
 ${PY} -m pip install flash-attn --no-build-isolation \
-    || echo "[run_minimal] WARNING: flash-attn install failed; will fall back to eager/sdpa attention"
+    || echo "[run] WARNING: flash-attn install failed; falling back to sdpa"
 
-echo "[run_minimal] installing verl (this repo) without deps"
 ${PY} -m pip install --no-deps -e . || fail "pip install -e . (verl)"
 
-# Detect whether flash-attn is importable; if not, disable remove_padding (which
-# requires flash-attn varlen) and use an sdpa attention implementation.
 if ${PY} -c "import flash_attn" >/dev/null 2>&1; then
-    USE_REMOVE_PADDING=True
-    ATTN_IMPL=""
-    echo "[run_minimal] flash-attn available -> remove_padding=True"
+    USE_REMOVE_PADDING=True; ATTN_IMPL=""
+    echo "[run] flash-attn available"
 else
-    USE_REMOVE_PADDING=False
-    ATTN_IMPL="sdpa"
-    echo "[run_minimal] flash-attn NOT available -> remove_padding=False, attn=sdpa"
+    USE_REMOVE_PADDING=False; ATTN_IMPL="sdpa"
+    echo "[run] flash-attn NOT available -> sdpa"
 fi
 
 ############################################
-# 2. Data: small slice of the paper's actual Guru math RLVR data
+# 2. Data: paper's Guru math RLVR train + MATH-500 eval
 ############################################
 DATA_DIR="${REPO_ROOT}/data"
 mkdir -p "${DATA_DIR}"
 TRAIN_FILE="${DATA_DIR}/math__combined_54.4k.parquet"
 MATH500_FILE="${DATA_DIR}/math__math_500.parquet"
-
 GURU="https://huggingface.co/datasets/LLM360/guru-RL-92k/resolve/main"
-if [ ! -f "${TRAIN_FILE}" ]; then
-    echo "[run_minimal] downloading train data"
-    wget -q -O "${TRAIN_FILE}" "${GURU}/train/math__combined_54.4k.parquet" || fail "download train parquet"
-fi
-if [ ! -f "${MATH500_FILE}" ]; then
-    echo "[run_minimal] downloading math-500 eval data"
-    wget -q -O "${MATH500_FILE}" "${GURU}/offline_eval/math__math_500.parquet" || fail "download math500 parquet"
-fi
-# Keep only the columns verl expects.
+[ -f "${TRAIN_FILE}" ]  || wget -q -O "${TRAIN_FILE}"  "${GURU}/train/math__combined_54.4k.parquet"   || fail "download train"
+[ -f "${MATH500_FILE}" ] || wget -q -O "${MATH500_FILE}" "${GURU}/offline_eval/math__math_500.parquet" || fail "download math500"
 ${PY} recipe/vimpo/data_preprocess/filter_test_dataset_keys.py --input_file "${MATH500_FILE}" || true
 
 ############################################
-# 3. Minimal training config
+# 3. Scaled comparison config (identical across arms)
 ############################################
-MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-0.6B-Base}"
-RUN_MODE="${RUN_MODE:-vimpo}"
+MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-1.7B-Base}"
 
-# Smoke-scale knobs
-TRAIN_PROMPT_BSZ=8
-N_RESP_PER_PROMPT=4
+TRAIN_PROMPT_BSZ=32
+N_RESP_PER_PROMPT=8
 MAX_PROMPT_LENGTH=1024
-MAX_RESPONSE_LENGTH=1024
-TRAIN_MAX_SAMPLES=64
-VAL_MAX_SAMPLES=32
-TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-4}"
-
+MAX_RESPONSE_LENGTH=2048
+TRAIN_MAX_SAMPLES=1024          # small slice of the 54.4k set
+VAL_MAX_SAMPLES=200             # MATH-500 slice (same for both arms)
+TOTAL_TRAINING_STEPS=30
+TEST_FREQ=5                     # eval on MATH-500 every 5 steps
 actor_ppo_max_token_len=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))
 
-echo "[run_minimal] launching VIMPO training (mode=${RUN_MODE}, model=${MODEL_PATH})"
-echo "[run_minimal] steps=${TOTAL_TRAINING_STEPS} bsz=${TRAIN_PROMPT_BSZ} n=${N_RESP_PER_PROMPT}"
+# W&B: stable names so the two arms are chartable side by side.
+export WANDB_API_KEY="${WANDB_API_KEY:-}"
+WANDB_PROJECT="vimpo-repro-compare"
+EXP_NAME="compare-${RUN_MODE}-qwen3-1.7b"
+if [ -n "${WANDB_API_KEY}" ]; then LOGGER='["console","wandb"]'; else LOGGER='["console"]'; fi
 
-# Single-GPU ray
+echo "[run] mode=${RUN_MODE} model=${MODEL_PATH} steps=${TOTAL_TRAINING_STEPS} logger=${LOGGER}"
+
 ray stop --force >/dev/null 2>&1 || true
 sleep 2
 
@@ -173,7 +156,7 @@ ${PY} -m recipe.vimpo.main_vimpo \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
-    actor_rollout_ref.actor.optim.lr_warmup_steps=2 \
+    actor_rollout_ref.actor.optim.lr_warmup_steps=5 \
     actor_rollout_ref.actor.optim.weight_decay=0.1 \
     actor_rollout_ref.actor.ppo_mini_batch_size=${TRAIN_PROMPT_BSZ} \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
@@ -182,7 +165,7 @@ ${PY} -m recipe.vimpo.main_vimpo \
     actor_rollout_ref.actor.grad_clip=1.0 \
     actor_rollout_ref.actor.loss_agg_mode=token-mean \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=1 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.45 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.50 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.max_model_len=${actor_ppo_max_token_len} \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
@@ -215,94 +198,66 @@ ${PY} -m recipe.vimpo.main_vimpo \
     vimpo_config.vimpo_update_ref_freq=0 \
     vimpo_config.use_grpo_actor=${use_grpo_actor} \
     vimpo_config.use_ppo_actor=${use_ppo_actor} \
-    trainer.logger="[console]" \
-    trainer.project_name=vimpo-minimal \
-    trainer.experiment_name="vimpo-minimal-${RUN_MODE}" \
+    trainer.logger="${LOGGER}" \
+    trainer.project_name="${WANDB_PROJECT}" \
+    trainer.experiment_name="${EXP_NAME}" \
     trainer.n_gpus_per_node=1 \
     trainer.nnodes=1 \
     trainer.val_before_train=True \
-    trainer.test_freq=2 \
+    trainer.test_freq=${TEST_FREQ} \
     trainer.save_freq=-1 \
-    trainer.total_epochs=1 \
+    trainer.total_epochs=10 \
     trainer.total_training_steps=${TOTAL_TRAINING_STEPS} \
-    trainer.default_local_dir="${REPO_ROOT}/ckpts/minimal" \
+    trainer.default_local_dir="${REPO_ROOT}/ckpts/compare" \
     trainer.resume_mode=disable \
     "${hydra_attn[@]}"
 TRAIN_RC=$?
 set +x
-
-if [ ${TRAIN_RC} -ne 0 ]; then
-    fail "training process exited with code ${TRAIN_RC}"
-fi
+[ ${TRAIN_RC} -ne 0 ] && fail "training exited code ${TRAIN_RC}"
 
 ############################################
-# 4. Write EVAL.md from the training log
+# 4. EVAL.md: extract MATH-500 val accuracy trajectory
 ############################################
-echo "[run_minimal] training finished; building EVAL.md"
+echo "[run] building EVAL.md"
 ${PY} - "$RUN_LOG" "$EVAL_MD" "$RUN_MODE" "$MODEL_PATH" "$TOTAL_TRAINING_STEPS" <<'PYEOF'
 import re, sys
-
 run_log, eval_md, run_mode, model, steps = sys.argv[1:6]
 text = open(run_log, errors="replace").read()
 
-# Pull val metrics (verl prints "val-core/.../mean@... :" lines and a metrics dict)
-val_lines = [l for l in text.splitlines() if "val-core" in l or "val/" in l]
-# Pull step lines
-step_lines = [l for l in text.splitlines() if re.search(r"step:\s*\d+", l)]
+# val accuracy at each eval: "val-core/math__math/acc/mean@1:<x>"
+accs = re.findall(r"val-core/math__math/acc/mean@1:([0-9.]+)", text)
+accs = [float(a) for a in accs]
+# step number paired with the metric line
+step_acc = []
+for m in re.finditer(r"step:(\d+)[^\n]*?val-core/math__math/acc/mean@1:([0-9.]+)", text):
+    step_acc.append((int(m.group(1)), float(m.group(2))))
+# val-before-train (step 0) is logged separately
+m0 = re.search(r"step:0 - val-aux/math__math/reward/mean@1:[0-9.]+[^\n]*?val-core/math__math/acc/mean@1:([0-9.]+)", text)
 
-def grab(pat):
-    m = re.findall(pat, text)
-    return m
-
-# value loss / advantage diagnostics emitted by VIMPO
-vimpo_keys = grab(r"(vimpo[^\s:=]*)\s*[:=]\s*(-?\d+\.?\d*(?:e-?\d+)?)")
-crit_acc = grab(r"val-core[^\s]*?:\s*(-?\d+\.?\d*)")
+base_acc = accs[0] if accs else None
+final_acc = accs[-1] if accs else None
+best_acc = max(accs) if accs else None
 
 with open(eval_md, "w") as f:
-    f.write("# VIMPO minimal reproduction — EVAL\n\n")
-    f.write("**arXiv 2606.20008 — Value-Implicit Policy Optimization for LLMs**\n\n")
-    f.write("Smallest end-to-end configuration that exercises the paper's core "
-            "mechanism: the policy-implied value loss plus the PPO actor branch "
-            "driven by the log-ratio TD advantage, on a single GPU.\n\n")
+    f.write(f"# VIMPO comparison — arm: {run_mode}\n\n")
+    f.write("arXiv 2606.20008. Identical config across the VIMPO and GRPO arms; "
+            "only the training objective differs.\n\n")
     f.write("## Config\n\n")
-    f.write(f"- mode: `{run_mode}`\n")
-    f.write(f"- model: `{model}`\n")
-    f.write(f"- training steps: {steps}\n")
-    f.write("- data: small slice of the paper's Guru math RLVR train set; "
-            "eval on MATH-500 slice\n\n")
-
-    f.write("## Result: did the VIMPO loop run end to end?\n\n")
-    ran_train = bool(step_lines)
-    f.write(f"- training steps observed: **{len(step_lines)}**\n")
-    f.write(f"- validation metric lines observed: **{len(val_lines)}**\n")
-    f.write(f"- VIMPO-specific diagnostics observed: **{len(vimpo_keys)}**\n\n")
-
-    verdict = "PASS — full VIMPO training loop executed end to end" if ran_train \
-        else "INCONCLUSIVE — no training step lines found in log"
-    f.write(f"**Verdict: {verdict}**\n\n")
-
-    if val_lines:
-        f.write("## Validation metrics (last occurrences)\n\n```\n")
-        f.write("\n".join(val_lines[-12:]))
-        f.write("\n```\n\n")
-
-    if step_lines:
-        f.write("## Training step lines (last few)\n\n```\n")
-        f.write("\n".join(step_lines[-6:]))
-        f.write("\n```\n\n")
-
-    if vimpo_keys:
-        f.write("## VIMPO diagnostics (sample)\n\n```\n")
-        seen = []
-        for k, v in vimpo_keys[:40]:
-            seen.append(f"{k} = {v}")
-        f.write("\n".join(seen))
-        f.write("\n```\n")
-print("EVAL.md written")
+    f.write(f"- mode: `{run_mode}`\n- model: `{model}`\n- training steps: {steps}\n")
+    f.write("- data: 1024-sample slice of Guru math train; MATH-500 (200) eval every 5 steps\n\n")
+    f.write("## MATH-500 validation accuracy (avg@1)\n\n")
+    f.write(f"- baseline (step 0): **{base_acc}**\n")
+    f.write(f"- best over training: **{best_acc}**\n")
+    f.write(f"- final: **{final_acc}**\n")
+    if base_acc is not None and best_acc is not None:
+        f.write(f"- best improvement over baseline: **{best_acc - base_acc:+.4f}**\n")
+    f.write("\n## Full eval trajectory (step, acc)\n\n```\n")
+    for s, a in step_acc:
+        f.write(f"step {s:>3}  acc@1 = {a:.4f}\n")
+    f.write("```\n")
+print("EVAL.md written; accs:", accs)
 PYEOF
 
-# Also surface EVAL.md at the repo root (the conventional location).
 cp -f "${EVAL_MD}" "${REPO_ROOT}/EVAL.md" || true
-
-echo "[run_minimal] done: $(date -u)"
+echo "[run] done: $(date -u)"
 cat "${EVAL_MD}"
